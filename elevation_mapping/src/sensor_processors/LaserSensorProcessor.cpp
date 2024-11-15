@@ -27,16 +27,25 @@ namespace elevation_mapping {
  * International Conference on Applied Robotics for the Power Industry (CARPI), 2012.
  */
 
-LaserSensorProcessor::LaserSensorProcessor(ros::NodeHandle& nodeHandle, const SensorProcessorBase::GeneralParameters& generalParameters)
+LaserSensorProcessor::LaserSensorProcessor(std::shared_ptr<rclcpp::Node>& nodeHandle, const SensorProcessorBase::GeneralParameters& generalParameters)
     : SensorProcessorBase(nodeHandle, generalParameters) {}
 
 LaserSensorProcessor::~LaserSensorProcessor() = default;
 
-bool LaserSensorProcessor::readParameters() {
-  SensorProcessorBase::readParameters();
-  nodeHandle_.param("sensor_processor/min_radius", sensorParameters_["min_radius"], 0.0);
-  nodeHandle_.param("sensor_processor/beam_angle", sensorParameters_["beam_angle"], 0.0);
-  nodeHandle_.param("sensor_processor/beam_constant", sensorParameters_["beam_constant"], 0.0);
+bool LaserSensorProcessor::readParameters(std::string& inputSourceName) {
+  SensorProcessorBase::readParameters(inputSourceName);
+
+  nodeHandle_->declare_parameter(inputSourceName + ".sensor_processor.min_radius", 0.0);
+  nodeHandle_->declare_parameter(inputSourceName + ".sensor_processor.beam_angle", 0.0);
+  nodeHandle_->declare_parameter(inputSourceName + ".sensor_processor.beam_constant", 0.0);
+  
+  nodeHandle_->get_parameter(inputSourceName + ".sensor_processor.min_radius", sensorParameters_["min_radius"]);
+  nodeHandle_->get_parameter(inputSourceName + ".sensor_processor.beam_angle", sensorParameters_["beam_angle"]);
+  nodeHandle_->get_parameter(inputSourceName + ".sensor_processor.beam_constant", sensorParameters_["beam_constant"]);
+
+  // nodeHandle_.param("sensor_processor/min_radius", sensorParameters_["min_radius"], 0.0);
+  // nodeHandle_.param("sensor_processor/beam_angle", sensorParameters_["beam_angle"], 0.0);
+  // nodeHandle_.param("sensor_processor/beam_constant", sensorParameters_["beam_constant"], 0.0);
   return true;
 }
 
@@ -49,7 +58,7 @@ bool LaserSensorProcessor::computeVariances(const PointCloudType::ConstPtr point
 
   // Sensor Jacobian (J_s).
   const Eigen::RowVector3f sensorJacobian =
-      projectionVector * (rotationMapToBase_.transposed() * rotationBaseToSensor_.transposed()).toImplementation().cast<float>();
+      projectionVector * (rotationMapToBase_ * rotationBaseToSensor_.transposed()).toImplementation().cast<float>();
 
   // Robot rotation covariance matrix (Sigma_q).
   Eigen::Matrix3f rotationVariance = robotPoseCovariance.bottomRightCorner(3, 3).cast<float>();

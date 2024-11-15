@@ -9,8 +9,8 @@
 #include <cmath>
 #include <cstring>
 
-#include <grid_map_msgs/GridMap.h>
-#include <ros/ros.h>
+#include <grid_map_msgs/msg/grid_map.hpp>
+#include <rclcpp/rclcpp.hpp>
 #include <Eigen/Dense>
 
 #include "elevation_mapping/ElevationMap.hpp"
@@ -33,16 +33,18 @@ float intAsFloat(const uint32_t input) {
 
 namespace elevation_mapping {
 
-ElevationMap::ElevationMap(ros::NodeHandle nodeHandle)
+ElevationMap::ElevationMap(std::shared_ptr<rclcpp::Node> nodeHandle)
     : nodeHandle_(nodeHandle),
-      rawMap_({"elevation", "variance", "horizontal_variance_x", "horizontal_variance_y", "horizontal_variance_xy", "color", "time",
-               "dynamic_time", "lowest_scan_point", "sensor_x_at_lowest_scan", "sensor_y_at_lowest_scan", "sensor_z_at_lowest_scan"}),
+      rawMap_({"elevation", "variance", "horizontal_variance_x", "horizontal_variance_y", 
+      "horizontal_variance_xy", "color", "time","dynamic_time", "lowest_scan_point", 
+      "sensor_x_at_lowest_scan", "sensor_y_at_lowest_scan", "sensor_z_at_lowest_scan"}),
       fusedMap_({"elevation", "upper_bound", "lower_bound", "color"}),
-      postprocessorPool_(nodeHandle.param("postprocessor_num_threads", 1), nodeHandle_),
+      // FIXME: Postprocessor num threads should be same as number of filters
+      postprocessorPool_(nodeHandle_->get_parameter("postprocessor_num_threads").as_int(), nodeHandle_),
       hasUnderlyingMap_(false),
       minVariance_(0.000009),
       maxVariance_(0.0009),
-      mahalanobisDistanceThreshold_(2.5),
+      mahalanobisDistanceThreshold_(1.5),
       multiHeightNoise_(0.000009),
       minHorizontalVariance_(0.0001),
       maxHorizontalVariance_(0.05),
@@ -54,46 +56,42 @@ ElevationMap::ElevationMap(ros::NodeHandle nodeHandle)
   fusedMap_.setBasicLayers({"elevation", "upper_bound", "lower_bound"});
   clear();
 
-  elevationMapFusedPublisher_ = nodeHandle_.advertise<grid_map_msgs::GridMap>("elevation_map", 1);
+  elevationMapFusedPublisher_ = nodeHandle_->create_publisher<grid_map_msgs::msg::GridMap>("elevation_map", 1);
   if (!underlyingMapTopic_.empty()) {
-    underlyingMapSubscriber_ = nodeHandle_.subscribe(underlyingMapTopic_, 1, &ElevationMap::underlyingMapCallback, this);
+    underlyingMapSubscriber_ = nodeHandle_->create_subscription<grid_map_msgs::msg::GridMap>(underlyingMapTopic_, 1, std::bind(&ElevationMap::underlyingMapCallback, this, std::placeholders::_1));
   }
   // TODO(max): if (enableVisibilityCleanup_) when parameter cleanup is ready.
-  visibilityCleanupMapPublisher_ = nodeHandle_.advertise<grid_map_msgs::GridMap>("visibility_cleanup_map", 1);
+  visibilityCleanupMapPublisher_ = nodeHandle_->create_publisher<grid_map_msgs::msg::GridMap>("visibility_cleanup_map", 1);
 
-  initialTime_ = ros::Time::now();
+  initialTime_ = nodeHandle_->get_clock()->now();
 }
 
 ElevationMap::~ElevationMap() = default;
 
-void ElevationMap::setGeometry(const grid_map::Length& length, const double& resolution, const grid_map::Position& position) {
-  boost::recursive_mutex::scoped_lock scopedLockForRawData(rawMapMutex_);
-  boost::recursive_mutex::scoped_lock scopedLockForFusedData(fusedMapMutex_);
-  rawMap_.setGeometry(length, resolution, position);
-  fusedMap_.setGeometry(length, resolution, position);
-  ROS_INFO_STREAM("Elevation map grid resized to " << rawMap_.getSize()(0) << " rows and " << rawMap_.getSize()(1) << " columns.");
-}
-bool ElevationMap::add(const PointCloudType::Ptr pointCloud, Eigen::VectorXf& pointCloudVariances, const ros::Time& timestamp,
+bool ElevationMap::add(const PointCloudType::Ptr pointCloud, Eigen::VectorXf& pointCloudVariances, const rclcpp::Time& timestamp,
                        const Eigen::Affine3d& transformationSensorToMap) {
   if (static_cast<unsigned int>(pointCloud->size()) != static_cast<unsigned int>(pointCloudVariances.size())) {
-    ROS_ERROR("ElevationMap::add: Size of point cloud (%i) and variances (%i) do not agree.", (int)pointCloud->size(),
+    RCLCPP_ERROR(nodeHandle_->get_logger(), "ElevationMap::add: Size of point cloud (%i) and variances (%i) do not agree.", (int)pointCloud->size(),
               (int)pointCloudVariances.size());
     return false;
   }
+  // RCLCPP_INFO(nodeHandle_->get_logger(), "Point cloud variances: %f, %f, %f", pointCloudVariances(0), pointCloudVariances(1), pointCloudVariances(2)) ;
 
   // Initialization for time calculation.
-  const ros::WallTime methodStartTime(ros::WallTime::now());
-  const ros::Time currentTime(ros::Time::now());
-  const float currentTimeSecondsPattern{intAsFloat(static_cast<uint32_t>(static_cast<uint64_t>(currentTime.toSec())))};
+  // RCLCPP_INFO(nodeHandle_->get_logger(), "ElevationMap::add: Initializing map.");
+  const auto methodStartTime = std::chrono::system_clock::now();
+  const rclcpp::Time currentTime = nodeHandle_->get_clock()->now();
+  const float currentTimeSecondsPattern{intAsFloat(static_cast<uint32_t>(static_cast<uint64_t>(currentTime.seconds())))};
   boost::recursive_mutex::scoped_lock scopedLockForRawData(rawMapMutex_);
 
   // Update initial time if it is not initialized.
-  if (initialTime_.toSec() == 0) {
+  if (initialTime_.seconds() == 0) {
     initialTime_ = timestamp;
   }
-  const float scanTimeSinceInitialization = (timestamp - initialTime_).toSec();
+  const float scanTimeSinceInitialization = (timestamp - initialTime_).seconds();
 
-  // Store references for efficient interation.
+  // Store references for efficient interaction.
+  // RCLCPP_INFO(nodeHandle_->get_logger(), "ElevationMap::add: Storing references.");
   auto& elevationLayer = rawMap_["elevation"];
   auto& varianceLayer = rawMap_["variance"];
   auto& horizontalVarianceXLayer = rawMap_["horizontal_variance_x"];
@@ -116,6 +114,7 @@ bool ElevationMap::add(const PointCloudType::Ptr pointCloud, Eigen::VectorXf& po
     auto& point = pointCloud->points[i];
     grid_map::Index index;
     grid_map::Position position(point.x, point.y);  // NOLINT(cppcoreguidelines-pro-type-union-access)
+    // RCLCPP_INFO(nodeHandle_->get_logger(), "Position in grid map: %f, %f", position.x(), position.y());
     if (!rawMap_.getIndex(position, index)) {
       continue;  // Skip this point if it does not lie within the elevation map.
     }
@@ -133,12 +132,16 @@ bool ElevationMap::add(const PointCloudType::Ptr pointCloud, Eigen::VectorXf& po
     auto& sensorYatLowestScan = sensorYatLowestScanLayer(index(0), index(1));
     auto& sensorZatLowestScan = sensorZatLowestScanLayer(index(0), index(1));
 
+    //const float& pointVariance = 1e-11 * pointCloudVariances(i);
     const float& pointVariance = pointCloudVariances(i);
     bool isValid = std::all_of(basicLayers_.begin(), basicLayers_.end(),
-                               [&](Eigen::Ref<const grid_map::Matrix> layer) { return std::isfinite(layer(index(0), index(1))); });
+                               [&](Eigen::Ref<const grid_map::Matrix> layer) { 
+                                return std::isfinite(layer(index(0), index(1))); });
     if (!isValid) {
       // No prior information in elevation map, use measurement.
+      // RCLCPP_INFO(nodeHandle_->get_logger(), "No prior information in elevation map, using measurement.");
       elevation = point.z;  // NOLINT(cppcoreguidelines-pro-type-union-access)
+      // RCLCPP_INFO(nodeHandle_->get_logger(), "Elevation is %f", elevation);
       variance = pointVariance;
       horizontalVarianceX = minHorizontalVariance_;
       horizontalVarianceY = minHorizontalVariance_;
@@ -147,27 +150,34 @@ bool ElevationMap::add(const PointCloudType::Ptr pointCloud, Eigen::VectorXf& po
       continue;
     }
 
+    // RCLCPP_INFO(nodeHandle_->get_logger(), "Elevation: %f, Point Z: %f, Variance: %f", elevation, point.z, variance);
     // Deal with multiple heights in one cell.
     const double mahalanobisDistance = fabs(point.z - elevation) / sqrt(variance);  // NOLINT(cppcoreguidelines-pro-type-union-access)
+    // RCLCPP_INFO(nodeHandle_->get_logger(), "Mahalanobis Distance: %f", mahalanobisDistance);
     if (mahalanobisDistance > mahalanobisDistanceThreshold_) {
+      // RCLCPP_INFO(nodeHandle_->get_logger(), "Mahalanobis distance exceeds threshold.");
       if (scanTimeSinceInitialization - time <= scanningDuration_ &&
           elevation > point.z) {  // NOLINT(cppcoreguidelines-pro-type-union-access)
+          // RCLCPP_INFO(nodeHandle_->get_logger(), "Ignoring point, lower than existing elevation and within scanning duration.");
         // Ignore point if measurement is from the same point cloud (time comparison) and
         // if measurement is lower then the elevation in the map.
       } else if (scanTimeSinceInitialization - time <= scanningDuration_) {
+        // RCLCPP_INFO(nodeHandle_->get_logger(), "Point is higher, updating elevation and variance.");
         // If point is higher.
         elevation = point.z;  // NOLINT(cppcoreguidelines-pro-type-union-access)
         variance = pointVariance;
+        
       } else {
+        // RCLCPP_INFO(nodeHandle_->get_logger(), "Increasing variance due to multi-height noise.");
         variance += multiHeightNoise_;
       }
-      continue;
+        continue;
     }
 
     // Store lowest points from scan for visibility checking.
-    const float pointHeightPlusUncertainty =
-        point.z + 3.0 * sqrt(pointVariance);  // 3 sigma. // NOLINT(cppcoreguidelines-pro-type-union-access)
+    const float pointHeightPlusUncertainty =  point.z + 3.0 * sqrt(pointVariance);  // 3 sigma. // NOLINT(cppcoreguidelines-pro-type-union-access)
     if (std::isnan(lowestScanPoint) || pointHeightPlusUncertainty < lowestScanPoint) {
+      // RCLCPP_INFO(nodeHandle_->get_logger(), "Updating lowest scan point.");
       lowestScanPoint = pointHeightPlusUncertainty;
       const grid_map::Position3 sensorTranslation(transformationSensorToMap.translation());
       sensorXatLowestScan = sensorTranslation.x();
@@ -175,7 +185,8 @@ bool ElevationMap::add(const PointCloudType::Ptr pointCloud, Eigen::VectorXf& po
       sensorZatLowestScan = sensorTranslation.z();
     }
 
-    // Fuse measurement with elevation map data.
+    // RCLCPP_INFO(nodeHandle_->get_logger(), "Fusing measurement with elevation map data.");
+    // Fuse measurement with elevation map data. aka kalman filter
     elevation =
         (variance * point.z + pointVariance * elevation) / (variance + pointVariance);  // NOLINT(cppcoreguidelines-pro-type-union-access)
     variance = (pointVariance * variance) / (pointVariance + variance);
@@ -188,19 +199,24 @@ bool ElevationMap::add(const PointCloudType::Ptr pointCloud, Eigen::VectorXf& po
     horizontalVarianceX = minHorizontalVariance_;
     horizontalVarianceY = minHorizontalVariance_;
     horizontalVarianceXY = 0.0;
+    // RCLCPP_INFO(nodeHandle_->get_logger(), "Updated map cell: Elevation = %f, Variance = %f", elevation, variance);
   }
 
+  //std::stringstream ss;
+  //ss << sensorXatLowestScanLayer.format(Eigen::IOFormat(Eigen::StreamPrecision, 0, ", ", "\n", "[", "]"));
+  //RCLCPP_INFO(nodeHandle_->get_logger(), "robotPoseCovariance: \n%s", ss.str().c_str() );
+  
   clean();
-  rawMap_.setTimestamp(timestamp.toNSec());  // Point cloud stores time in microseconds.
+  rawMap_.setTimestamp(timestamp.nanoseconds());  // Point cloud stores time in microseconds.
 
-  const ros::WallDuration duration = ros::WallTime::now() - methodStartTime;
-  ROS_DEBUG("Raw map has been updated with a new point cloud in %f s.", duration.toSec());
+  const std::chrono::duration<double> duration  = std::chrono::system_clock::now() - methodStartTime;
+  // RCLCPP_INFO(nodeHandle_->get_logger(), "Raw map has been updated with a new point cloud in %f s.", duration.count());
   return true;
 }
 
 bool ElevationMap::update(const grid_map::Matrix& varianceUpdate, const grid_map::Matrix& horizontalVarianceUpdateX,
                           const grid_map::Matrix& horizontalVarianceUpdateY, const grid_map::Matrix& horizontalVarianceUpdateXY,
-                          const ros::Time& time) {
+                          const rclcpp::Time& time) {
   boost::recursive_mutex::scoped_lock scopedLock(rawMapMutex_);
 
   const auto& size = rawMap_.getSize();
@@ -209,7 +225,7 @@ bool ElevationMap::update(const grid_map::Matrix& varianceUpdate, const grid_map
         (grid_map::Index(horizontalVarianceUpdateX.rows(), horizontalVarianceUpdateX.cols()) == size).all() &&
         (grid_map::Index(horizontalVarianceUpdateY.rows(), horizontalVarianceUpdateY.cols()) == size).all() &&
         (grid_map::Index(horizontalVarianceUpdateXY.rows(), horizontalVarianceUpdateXY.cols()) == size).all())) {
-    ROS_ERROR("The size of the update matrices does not match.");
+    RCLCPP_ERROR(nodeHandle_->get_logger(), "The size of the update matrices does not match.");
     return false;
   }
 
@@ -218,40 +234,13 @@ bool ElevationMap::update(const grid_map::Matrix& varianceUpdate, const grid_map
   rawMap_.get("horizontal_variance_y") += horizontalVarianceUpdateY;
   rawMap_.get("horizontal_variance_xy") += horizontalVarianceUpdateXY;
   clean();
-  rawMap_.setTimestamp(time.toNSec());
+  rawMap_.setTimestamp(time.nanoseconds());
 
   return true;
 }
 
-bool ElevationMap::fuseAll() {
-  ROS_DEBUG("Requested to fuse entire elevation map.");
-  boost::recursive_mutex::scoped_lock scopedLock(fusedMapMutex_);
-  return fuse(grid_map::Index(0, 0), fusedMap_.getSize());
-}
-
-bool ElevationMap::fuseArea(const Eigen::Vector2d& position, const Eigen::Array2d& length) {
-  ROS_DEBUG("Requested to fuse an area of the elevation map with center at (%f, %f) and side lengths (%f, %f)", position[0], position[1],
-            length[0], length[1]);
-
-  grid_map::Index topLeftIndex;
-  grid_map::Index submapBufferSize;
-
-  // These parameters are not used in this function.
-  grid_map::Position submapPosition;
-  grid_map::Length submapLength;
-  grid_map::Index requestedIndexInSubmap;
-
-  boost::recursive_mutex::scoped_lock scopedLock(fusedMapMutex_);
-
-  grid_map::getSubmapInformation(topLeftIndex, submapBufferSize, submapPosition, submapLength, requestedIndexInSubmap, position, length,
-                                 rawMap_.getLength(), rawMap_.getPosition(), rawMap_.getResolution(), rawMap_.getSize(),
-                                 rawMap_.getStartIndex());
-
-  return fuse(topLeftIndex, submapBufferSize);
-}
-
 bool ElevationMap::fuse(const grid_map::Index& topLeftIndex, const grid_map::Index& size) {
-  ROS_DEBUG("Fusing elevation map...");
+  RCLCPP_DEBUG(nodeHandle_->get_logger(), "Fusing elevation map...");
 
   // Nothing to do.
   if ((size == 0).any()) {
@@ -259,7 +248,7 @@ bool ElevationMap::fuse(const grid_map::Index& topLeftIndex, const grid_map::Ind
   }
 
   // Initializations.
-  const ros::WallTime methodStartTime(ros::WallTime::now());
+  const auto methodStartTime = std::chrono::system_clock::now();  
 
   // Copy raw elevation map data for safe multi-threading.
   boost::recursive_mutex::scoped_lock scopedLockForRawData(rawMapMutex_);
@@ -392,7 +381,7 @@ bool ElevationMap::fuse(const grid_map::Index& topLeftIndex, const grid_map::Ind
     float mean = (weights * means).sum() / weights.sum();
 
     if (!std::isfinite(mean)) {
-      ROS_ERROR("Something went wrong when fusing the map: Mean = %f", mean);
+      RCLCPP_ERROR(nodeHandle_->get_logger(), "Something went wrong when fusing the map: Mean = %f", mean);
       continue;
     }
 
@@ -408,32 +397,19 @@ bool ElevationMap::fuse(const grid_map::Index& topLeftIndex, const grid_map::Ind
 
   fusedMap_.setTimestamp(rawMapCopy.getTimestamp());
 
-  const ros::WallDuration duration(ros::WallTime::now() - methodStartTime);
-  ROS_DEBUG("Elevation map has been fused in %f s.", duration.toSec());
+  const std::chrono::duration<double> duration = std::chrono::system_clock::now() - methodStartTime;
+  RCLCPP_DEBUG(nodeHandle_->get_logger(), "Elevation map has been fused in %f s.", duration.count());
 
   return true;
 }
 
-bool ElevationMap::clear() {
-  // Lock raw and fused map object in different scopes to prevent deadlock.
-  {
-    boost::recursive_mutex::scoped_lock scopedLockForRawData(rawMapMutex_);
-    rawMap_.clearAll();
-    rawMap_.resetTimestamp();
-    rawMap_.get("dynamic_time").setZero();
-  }
-  {
-    boost::recursive_mutex::scoped_lock scopedLockForFusedData(fusedMapMutex_);
-    fusedMap_.clearAll();
-    fusedMap_.resetTimestamp();
-  }
-  return true;
-}
 
-void ElevationMap::visibilityCleanup(const ros::Time& updatedTime) {
+
+
+void ElevationMap::visibilityCleanup(const rclcpp::Time& updatedTime) {
   // Get current time to compute calculation time.
-  const ros::WallTime methodStartTime(ros::WallTime::now());
-  const double timeSinceInitialization = (updatedTime - initialTime_).toSec();
+  const auto methodStartTime = std::chrono::system_clock::now();
+  const double timeSinceInitialization = (updatedTime - initialTime_).seconds();
 
   // Copy raw elevation map data for safe multi-threading.
   boost::recursive_mutex::scoped_lock scopedLockForVisibilityCleanupData(visibilityCleanupMapMutex_);
@@ -521,10 +497,10 @@ void ElevationMap::visibilityCleanup(const ros::Time& updatedTime) {
   // Publish visibility cleanup map for debugging.
   publishVisibilityCleanupMap();
 
-  ros::WallDuration duration(ros::WallTime::now() - methodStartTime);
-  ROS_DEBUG("Visibility cleanup has been performed in %f s (%d points).", duration.toSec(), (int)cellPositionsToRemove.size());
-  if (duration.toSec() > visibilityCleanupDuration_) {
-    ROS_WARN("Visibility cleanup duration is too high (current rate is %f).", 1.0 / duration.toSec());
+  const std::chrono::duration<double> duration = std::chrono::system_clock::now() - methodStartTime;
+  RCLCPP_DEBUG(nodeHandle_->get_logger(), "Visibility cleanup has been performed in %f s (%d points).", duration.count(), (int)cellPositionsToRemove.size());
+  if (duration.count() > visibilityCleanupDuration_) {
+    RCLCPP_WARN(nodeHandle_->get_logger(), "Visibility cleanup duration is too high (current rate is %f).", 1.0 / duration.count());
   }
 }
 
@@ -533,7 +509,7 @@ void ElevationMap::move(const Eigen::Vector2d& position) {
   std::vector<grid_map::BufferRegion> newRegions;
 
   if (rawMap_.move(position, newRegions)) {
-    ROS_DEBUG("Elevation map has been moved to position (%f, %f).", rawMap_.getPosition().x(), rawMap_.getPosition().y());
+    RCLCPP_DEBUG(nodeHandle_->get_logger(), "Elevation map has been moved to position (%f, %f).", rawMap_.getPosition().x(), rawMap_.getPosition().y());
 
     // The "dynamic_time" layer is meant to be interpreted as integer values, therefore nan:s need to be zeroed.
     grid_map::Matrix& dynTime{rawMap_.get("dynamic_time")};
@@ -545,166 +521,10 @@ void ElevationMap::move(const Eigen::Vector2d& position) {
   }
 }
 
-bool ElevationMap::postprocessAndPublishRawElevationMap() {
-  if (!hasRawMapSubscribers()) {
-    return false;
-  }
-  boost::recursive_mutex::scoped_lock scopedLock(rawMapMutex_);
-  grid_map::GridMap rawMapCopy = rawMap_;
-  scopedLock.unlock();
-  return postprocessorPool_.runTask(rawMapCopy);
-}
 
-bool ElevationMap::publishFusedElevationMap() {
-  if (!hasFusedMapSubscribers()) {
-    return false;
-  }
-  boost::recursive_mutex::scoped_lock scopedLock(fusedMapMutex_);
-  grid_map::GridMap fusedMapCopy = fusedMap_;
-  scopedLock.unlock();
-  fusedMapCopy.add("uncertainty_range", fusedMapCopy.get("upper_bound") - fusedMapCopy.get("lower_bound"));
-  grid_map_msgs::GridMap message;
-  grid_map::GridMapRosConverter::toMessage(fusedMapCopy, message);
-  elevationMapFusedPublisher_.publish(message);
-  ROS_DEBUG("Elevation map (fused) has been published.");
-  return true;
-}
 
-bool ElevationMap::publishVisibilityCleanupMap() {
-  if (visibilityCleanupMapPublisher_.getNumSubscribers() < 1) {
-    return false;
-  }
-  boost::recursive_mutex::scoped_lock scopedLock(visibilityCleanupMapMutex_);
-  grid_map::GridMap visibilityCleanupMapCopy = visibilityCleanupMap_;
-  scopedLock.unlock();
-  visibilityCleanupMapCopy.erase("elevation");
-  visibilityCleanupMapCopy.erase("variance");
-  visibilityCleanupMapCopy.erase("horizontal_variance_x");
-  visibilityCleanupMapCopy.erase("horizontal_variance_y");
-  visibilityCleanupMapCopy.erase("horizontal_variance_xy");
-  visibilityCleanupMapCopy.erase("color");
-  visibilityCleanupMapCopy.erase("time");
-  grid_map_msgs::GridMap message;
-  grid_map::GridMapRosConverter::toMessage(visibilityCleanupMapCopy, message);
-  visibilityCleanupMapPublisher_.publish(message);
-  ROS_DEBUG("Visibility cleanup map has been published.");
-  return true;
-}
 
-grid_map::GridMap& ElevationMap::getRawGridMap() {
-  return rawMap_;
-}
 
-void ElevationMap::setRawGridMap(const grid_map::GridMap& map) {
-  boost::recursive_mutex::scoped_lock scopedLockForRawData(rawMapMutex_);
-  rawMap_ = map;
-}
-
-grid_map::GridMap& ElevationMap::getFusedGridMap() {
-  return fusedMap_;
-}
-
-void ElevationMap::setFusedGridMap(const grid_map::GridMap& map) {
-  boost::recursive_mutex::scoped_lock scopedLockForFusedData(fusedMapMutex_);
-  fusedMap_ = map;
-}
-
-ros::Time ElevationMap::getTimeOfLastUpdate() {
-  return ros::Time().fromNSec(rawMap_.getTimestamp());
-}
-
-ros::Time ElevationMap::getTimeOfLastFusion() {
-  boost::recursive_mutex::scoped_lock scopedLock(fusedMapMutex_);
-  return ros::Time().fromNSec(fusedMap_.getTimestamp());
-}
-
-const kindr::HomTransformQuatD& ElevationMap::getPose() {
-  return pose_;
-}
-
-bool ElevationMap::getPosition3dInRobotParentFrame(const Eigen::Array2i& index, kindr::Position3D& position) {
-  kindr::Position3D positionInGridFrame;
-  if (!rawMap_.getPosition3("elevation", index, positionInGridFrame.vector())) {
-    return false;
-  }
-  position = pose_.transform(positionInGridFrame);
-  return true;
-}
-
-boost::recursive_mutex& ElevationMap::getFusedDataMutex() {
-  return fusedMapMutex_;
-}
-
-boost::recursive_mutex& ElevationMap::getRawDataMutex() {
-  return rawMapMutex_;
-}
-
-bool ElevationMap::clean() {
-  boost::recursive_mutex::scoped_lock scopedLockForRawData(rawMapMutex_);
-  rawMap_.get("variance") = rawMap_.get("variance").unaryExpr(VarianceClampOperator<float>(minVariance_, maxVariance_));
-  rawMap_.get("horizontal_variance_x") =
-      rawMap_.get("horizontal_variance_x").unaryExpr(VarianceClampOperator<float>(minHorizontalVariance_, maxHorizontalVariance_));
-  rawMap_.get("horizontal_variance_y") =
-      rawMap_.get("horizontal_variance_y").unaryExpr(VarianceClampOperator<float>(minHorizontalVariance_, maxHorizontalVariance_));
-  return true;
-}
-
-void ElevationMap::resetFusedData() {
-  boost::recursive_mutex::scoped_lock scopedLockForFusedData(fusedMapMutex_);
-  fusedMap_.clearAll();
-  fusedMap_.resetTimestamp();
-}
-
-void ElevationMap::setFrameId(const std::string& frameId) {
-  rawMap_.setFrameId(frameId);
-  fusedMap_.setFrameId(frameId);
-}
-
-void ElevationMap::setTimestamp(ros::Time timestamp) {
-  rawMap_.setTimestamp(timestamp.toNSec());
-  fusedMap_.setTimestamp(timestamp.toNSec());
-}
-
-const std::string& ElevationMap::getFrameId() {
-  return rawMap_.getFrameId();
-}
-
-bool ElevationMap::hasRawMapSubscribers() const {
-  return postprocessorPool_.pipelineHasSubscribers();
-}
-
-bool ElevationMap::hasFusedMapSubscribers() const {
-  return elevationMapFusedPublisher_.getNumSubscribers() >= 1;
-}
-
-void ElevationMap::underlyingMapCallback(const grid_map_msgs::GridMap& underlyingMap) {
-  ROS_INFO("Updating underlying map.");
-  grid_map::GridMapRosConverter::fromMessage(underlyingMap, underlyingMap_);
-  if (underlyingMap_.getFrameId() != rawMap_.getFrameId()) {
-    ROS_ERROR_STREAM("The underlying map does not have the same map frame ('" << underlyingMap_.getFrameId() << "') as the elevation map ('"
-                                                                              << rawMap_.getFrameId() << "').");
-    return;
-  }
-  if (!underlyingMap_.exists("elevation")) {
-    ROS_ERROR_STREAM("The underlying map does not have an 'elevation' layer.");
-    return;
-  }
-  if (!underlyingMap_.exists("variance")) {
-    underlyingMap_.add("variance", minVariance_);
-  }
-  if (!underlyingMap_.exists("horizontal_variance_x")) {
-    underlyingMap_.add("horizontal_variance_x", minHorizontalVariance_);
-  }
-  if (!underlyingMap_.exists("horizontal_variance_y")) {
-    underlyingMap_.add("horizontal_variance_y", minHorizontalVariance_);
-  }
-  if (!underlyingMap_.exists("color")) {
-    underlyingMap_.add("color", 0.0);
-  }
-  underlyingMap_.setBasicLayers(rawMap_.getBasicLayers());
-  hasUnderlyingMap_ = true;
-  rawMap_.addDataFrom(underlyingMap_, false, false, true);
-}
 
 void ElevationMap::setRawSubmapHeight(const grid_map::Position& initPosition, float mapHeight, double lengthInXSubmap,
                                       double lengthInYSubmap, double margin) {
@@ -732,8 +552,241 @@ void ElevationMap::setRawSubmapHeight(const grid_map::Position& initPosition, fl
   }
 }
 
+
+bool ElevationMap::postprocessAndPublishRawElevationMap() {
+  if (!hasRawMapSubscribers()) {
+    return false;
+  }
+  boost::recursive_mutex::scoped_lock scopedLock(rawMapMutex_);
+  grid_map::GridMap rawMapCopy = rawMap_; 
+  scopedLock.unlock();
+  return postprocessorPool_.runTask(rawMapCopy);
+}
+
+bool ElevationMap::publishFusedElevationMap() {
+  if (!hasFusedMapSubscribers()) {
+    return false;
+  }
+  boost::recursive_mutex::scoped_lock scopedLock(fusedMapMutex_);
+  grid_map::GridMap fusedMapCopy = fusedMap_;
+  scopedLock.unlock();
+  fusedMapCopy.add("uncertainty_range", fusedMapCopy.get("upper_bound") - fusedMapCopy.get("lower_bound"));
+  std::unique_ptr<grid_map_msgs::msg::GridMap> message;
+  message = grid_map::GridMapRosConverter::toMessage(fusedMapCopy);
+  elevationMapFusedPublisher_->publish(std::move(message));
+  RCLCPP_DEBUG(nodeHandle_->get_logger(), "Elevation map (fused) has been published.");
+  return true;
+}
+
+bool ElevationMap::publishVisibilityCleanupMap() {
+  if (visibilityCleanupMapPublisher_->get_subscription_count() < 1) {
+    return false;
+  }
+  boost::recursive_mutex::scoped_lock scopedLock(visibilityCleanupMapMutex_);
+  grid_map::GridMap visibilityCleanupMapCopy = visibilityCleanupMap_;
+  scopedLock.unlock();
+  visibilityCleanupMapCopy.erase("elevation");
+  visibilityCleanupMapCopy.erase("variance");
+  visibilityCleanupMapCopy.erase("horizontal_variance_x");
+  visibilityCleanupMapCopy.erase("horizontal_variance_y");
+  visibilityCleanupMapCopy.erase("horizontal_variance_xy");
+  visibilityCleanupMapCopy.erase("color");
+  visibilityCleanupMapCopy.erase("time");
+  std::unique_ptr<grid_map_msgs::msg::GridMap> message;
+  message = grid_map::GridMapRosConverter::toMessage(visibilityCleanupMapCopy);
+  visibilityCleanupMapPublisher_->publish(std::move(message));
+  RCLCPP_DEBUG(nodeHandle_->get_logger(), "Visibility cleanup map has been published.");
+  return true;
+}
+
+void ElevationMap::underlyingMapCallback(const grid_map_msgs::msg::GridMap::SharedPtr underlyingMap) {
+  RCLCPP_INFO(nodeHandle_->get_logger(), "Updating underlying map.");
+  grid_map::GridMapRosConverter::fromMessage(*underlyingMap, underlyingMap_);
+  if (underlyingMap_.getFrameId() != rawMap_.getFrameId()) {
+    RCLCPP_ERROR_STREAM(nodeHandle_->get_logger(), "The underlying map does not have the same map frame ('" << underlyingMap_.getFrameId() << "') as the elevation map ('"
+                                                                              << rawMap_.getFrameId() << "').");
+    return;
+  }
+  if (!underlyingMap_.exists("elevation")) {
+    RCLCPP_ERROR_STREAM(nodeHandle_->get_logger(), "The underlying map does not have an 'elevation' layer.");
+    return;
+  }
+  if (!underlyingMap_.exists("variance")) {
+    underlyingMap_.add("variance", minVariance_);
+  }
+  if (!underlyingMap_.exists("horizontal_variance_x")) {
+    underlyingMap_.add("horizontal_variance_x", minHorizontalVariance_);
+  }
+  if (!underlyingMap_.exists("horizontal_variance_y")) {
+    underlyingMap_.add("horizontal_variance_y", minHorizontalVariance_);
+  }
+  if (!underlyingMap_.exists("color")) {
+    underlyingMap_.add("color", 0.0);
+  }
+  underlyingMap_.setBasicLayers(rawMap_.getBasicLayers());
+  hasUnderlyingMap_ = true;
+  rawMap_.addDataFrom(underlyingMap_, false, false, true);
+}
+
+
+
+
+
+
+
+bool ElevationMap::clear() {
+  // Lock raw and fused map object in different scopes to prevent deadlock.
+  {
+    boost::recursive_mutex::scoped_lock scopedLockForRawData(rawMapMutex_);
+    rawMap_.clearAll();
+    rawMap_.resetTimestamp();
+    rawMap_.get("dynamic_time").setZero();
+  }
+  {
+    boost::recursive_mutex::scoped_lock scopedLockForFusedData(fusedMapMutex_);
+    fusedMap_.clearAll();
+    fusedMap_.resetTimestamp();
+  }
+  return true;
+} 
+
+void ElevationMap::setGeometry(const grid_map::Length& length, const double& resolution, const grid_map::Position& position) {
+  boost::recursive_mutex::scoped_lock scopedLockForRawData(rawMapMutex_);
+  boost::recursive_mutex::scoped_lock scopedLockForFusedData(fusedMapMutex_);
+  rawMap_.setGeometry(length, resolution, position);
+  fusedMap_.setGeometry(length, resolution, position);
+  RCLCPP_INFO_STREAM(nodeHandle_->get_logger(), "Elevation map grid resized to " << rawMap_.getSize()(0) << " rows and " << rawMap_.getSize()(1) << " columns.");
+}
+
 float ElevationMap::cumulativeDistributionFunction(float x, float mean, float standardDeviation) {
   return 0.5 * erfc(-(x - mean) / (standardDeviation * sqrt(2.0)));
 }
+
+bool ElevationMap::hasFusedMapSubscribers() const {
+  return elevationMapFusedPublisher_->get_subscription_count() >= 1;
+}
+
+//sets frame id for both maps.
+void ElevationMap::setFrameId(const std::string& frameId) {
+  rawMap_.setFrameId(frameId);
+  fusedMap_.setFrameId(frameId);
+}
+
+//gives time in nanoseconds (of type RCL_TIME) to the maps.
+void ElevationMap::setTimestamp(rclcpp::Time timestamp) {
+  rawMap_.setTimestamp(timestamp.nanoseconds());
+  fusedMap_.setTimestamp(timestamp.nanoseconds());
+}
+
+//gets frame id from map raw.
+const std::string& ElevationMap::getFrameId() {
+  return rawMap_.getFrameId();
+}
+
+bool ElevationMap::hasRawMapSubscribers() const {
+  return postprocessorPool_.pipelineHasSubscribers();
+}
+
+bool ElevationMap::clean() {
+  boost::recursive_mutex::scoped_lock scopedLockForRawData(rawMapMutex_);
+  rawMap_.get("variance") = rawMap_.get("variance").unaryExpr(VarianceClampOperator<float>(minVariance_, maxVariance_));
+  rawMap_.get("horizontal_variance_x") =
+      rawMap_.get("horizontal_variance_x").unaryExpr(VarianceClampOperator<float>(minHorizontalVariance_, maxHorizontalVariance_));
+  rawMap_.get("horizontal_variance_y") =
+      rawMap_.get("horizontal_variance_y").unaryExpr(VarianceClampOperator<float>(minHorizontalVariance_, maxHorizontalVariance_));
+  return true;
+}
+
+void ElevationMap::resetFusedData() {
+  boost::recursive_mutex::scoped_lock scopedLockForFusedData(fusedMapMutex_);
+  fusedMap_.clearAll();
+  fusedMap_.resetTimestamp();
+}
+
+bool ElevationMap::fuseAll() {
+  RCLCPP_DEBUG(nodeHandle_->get_logger(), "Requested to fuse entire elevation map.");
+  boost::recursive_mutex::scoped_lock scopedLock(fusedMapMutex_);
+  return fuse(grid_map::Index(0, 0), fusedMap_.getSize());
+}
+
+bool ElevationMap::fuseArea(const Eigen::Vector2d& position, const Eigen::Array2d& length) {
+  RCLCPP_DEBUG(nodeHandle_->get_logger(), "Requested to fuse an area of the elevation map with center at (%f, %f) and side lengths (%f, %f)", position[0], position[1],
+            length[0], length[1]);
+
+  grid_map::Index topLeftIndex;
+  grid_map::Index submapBufferSize;
+
+  // These parameters are not used in this function.
+  grid_map::Position submapPosition;
+  grid_map::Length submapLength;
+  grid_map::Index requestedIndexInSubmap;
+
+  boost::recursive_mutex::scoped_lock scopedLock(fusedMapMutex_);
+
+  grid_map::getSubmapInformation(topLeftIndex, submapBufferSize, submapPosition, submapLength, requestedIndexInSubmap, position, length,
+                                 rawMap_.getLength(), rawMap_.getPosition(), rawMap_.getResolution(), rawMap_.getSize(),
+                                 rawMap_.getStartIndex());
+
+  return fuse(topLeftIndex, submapBufferSize);
+}
+
+grid_map::GridMap& ElevationMap::getRawGridMap() {
+  return rawMap_;
+}
+
+void ElevationMap::setRawGridMap(const grid_map::GridMap& map) {
+  boost::recursive_mutex::scoped_lock scopedLockForRawData(rawMapMutex_);
+  rawMap_ = map;
+}
+
+grid_map::GridMap& ElevationMap::getFusedGridMap() {
+  return fusedMap_;
+}
+
+void ElevationMap::setFusedGridMap(const grid_map::GridMap& map) {
+  boost::recursive_mutex::scoped_lock scopedLockForFusedData(fusedMapMutex_);
+  fusedMap_ = map;
+}
+
+rclcpp::Time ElevationMap::getTimeOfLastUpdate() {
+  return rclcpp::Time(rawMap_.getTimestamp(), RCL_ROS_TIME);
+}
+
+rclcpp::Time ElevationMap::getTimeOfLastFusion() {
+  boost::recursive_mutex::scoped_lock scopedLock(fusedMapMutex_);
+  return rclcpp::Time(fusedMap_.getTimestamp(), RCL_ROS_TIME);
+}
+
+const kindr::HomTransformQuatD& ElevationMap::getPose() {
+  return pose_;
+}
+
+bool ElevationMap::getPosition3dInRobotParentFrame(const Eigen::Array2i& index, kindr::Position3D& position) {
+  kindr::Position3D positionInGridFrame;
+  if (!rawMap_.getPosition3("elevation", index, positionInGridFrame.vector())) {
+    return false;
+  }
+  position = pose_.transform(positionInGridFrame);
+  return true;
+}
+
+boost::recursive_mutex& ElevationMap::getFusedDataMutex() {
+  return fusedMapMutex_;
+}
+
+boost::recursive_mutex& ElevationMap::getRawDataMutex() {
+  return rawMapMutex_;
+}
+
+
+
+
+
+
+
+
+
+
+
 
 }  // namespace elevation_mapping
