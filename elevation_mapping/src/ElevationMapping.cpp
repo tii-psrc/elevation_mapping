@@ -156,14 +156,15 @@ ElevationMapping::~ElevationMapping() {
     rawSubmapService_.reset();
     fusionTriggerService_.reset();
     fusedSubmapService_.reset();
-    fusedMapPublishTimer_->cancel();
+    // Timers exist only when their rate is non-zero (setupTimers).
+    if (fusedMapPublishTimer_) fusedMapPublishTimer_->cancel();
 
     // fusionServiceQueue_.disable();
     // fusionServiceQueue_.clear();
   }
 
   {  // Visibility cleanup queue
-    visibilityCleanupTimer_->cancel();
+    if (visibilityCleanupTimer_) visibilityCleanupTimer_->cancel();
 
     // visibilityCleanupQueue_.disable();
     // visibilityCleanupQueue_.clear();
@@ -343,7 +344,7 @@ bool ElevationMapping::initialize() {
   //fusionServiceThread_ = std::thread(boost::bind(&ElevationMapping::runFusionServiceThread, this));
   rclcpp::sleep_for(std::chrono::seconds(1));  // Need this to get the TF caches fill up.
   // resetMapUpdateTimer();
-  fusedMapPublishTimer_->reset();
+  if (fusedMapPublishTimer_) fusedMapPublishTimer_->reset();
   // visibilityCleanupThread_ = boost::thread(boost::bind(&ElevationMapping::visibilityCleanupThread, this));
   // visibilityCleanupTimer_.reset();  //TODO:foxy does not have timer autostart flag implemented, fix in future version
   initializeElevationMap();
